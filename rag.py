@@ -1,11 +1,18 @@
-"""Core RAG pipeline: load docs -> chunk -> embed -> FAISS -> retrieve -> answer with Claude."""
-import os
-import numpy as np
-import faiss
-from pypdf import PdfReader
-from anthropic import Anthropic
+"""Core RAG pipeline with an offline fallback for local demos and testing."""
+import re
+from collections import Counter
+from typing import Optional
 
-EMBED_MODEL = "voyage-3"  # via Anthropic-compatible embeddings; see note in README
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover - optional dependency
+    PdfReader = None
+
+try:
+    from anthropic import Anthropic
+except Exception:  # pragma: no cover - optional dependency
+    Anthropic = None
+
 CHAT_MODEL = "claude-sonnet-4-5"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
@@ -16,6 +23,8 @@ def read_file(file) -> str:
     """Extract text from an uploaded PDF or txt file-like object."""
     name = file.name.lower()
     if name.endswith(".pdf"):
+        if PdfReader is None:
+            return "PDF extraction is unavailable in this environment."
         reader = PdfReader(file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
     return file.read().decode("utf-8", errors="ignore")
@@ -24,6 +33,8 @@ def read_file(file) -> str:
 def chunk_text(text: str, source: str):
     """Split text into overlapping chunks, tagged with their source filename."""
     text = " ".join(text.split())
+    if not text:
+        return []
     chunks = []
     start = 0
     while start < len(text):
@@ -34,55 +45,91 @@ def chunk_text(text: str, source: str):
 
 
 class VectorStore:
-    """FAISS-backed store of chunk embeddings using Voyage embeddings."""
+    """Lightweight local vector store that works without external embeddings APIs."""
 
-    def __init__(self, client):
+    def __init__(self, client=None):
         self.client = client
-        self.index = None
         self.chunks = []
+        self.vectors = []
 
-    def _embed(self, texts):
-        import voyageai
-        vo = voyageai.Client()  # reads VOYAGE_API_KEY
-        result = vo.embed(texts, model="voyage-3", input_type="document")
-        return np.array(result.embeddings, dtype="float32")
+    def _tokenize(self, text: str):
+        return [token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 1]
+
+    def _vectorize(self, text: str):
+        tokens = self._tokenize(text)
+        if not tokens:
+            return {}
+        counts = Counter(tokens)
+        return counts
 
     def build(self, chunks):
         self.chunks = chunks
-        vecs = self._embed([c["text"] for c in chunks])
-        faiss.normalize_L2(vecs)
-        self.index = faiss.IndexFlatIP(vecs.shape[1])
-        self.index.add(vecs)
+        self.vectors = [self._vectorize(c["text"]) for c in chunks]
 
     def search(self, query, k=TOP_K):
-        import voyageai
-        vo = voyageai.Client()
-        q = np.array(
-            vo.embed([query], model="voyage-3", input_type="query").embeddings,
-            dtype="float32",
-        )
-        faiss.normalize_L2(q)
-        scores, idx = self.index.search(q, k)
-        return [self.chunks[i] for i in idx[0] if i != -1]
+        query_vec = self._vectorize(query)
+        if not self.vectors:
+            return []
+
+        scored = []
+        for index, chunk_vec in enumerate(self.vectors):
+            if not query_vec:
+                score = 0.0
+            else:
+                shared_terms = set(query_vec) & set(chunk_vec)
+                score = sum(query_vec[token] * chunk_vec[token] for token in shared_terms)
+            scored.append((score, index))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        top_indices = [index for _, index in scored[:k]]
+        return [self.chunks[index] for index in top_indices if index < len(self.chunks)]
 
 
-def answer(client: Anthropic, query: str, contexts):
-    """Ask Claude to answer using only the retrieved contexts, citing sources."""
-    context_block = "\n\n".join(
-        f"[Source: {c['source']}]\n{c['text']}" for c in contexts
-    )
-    system = (
-        "You are a document assistant. Answer the user's question using ONLY the "
-        "provided context. Cite the source filename for each claim. If the context "
-        "does not contain the answer, say so plainly."
-    )
-    msg = client.messages.create(
-        model=CHAT_MODEL,
-        max_tokens=1024,
-        system=system,
-        messages=[{
-            "role": "user",
-            "content": f"Context:\n{context_block}\n\nQuestion: {query}",
-        }],
-    )
-    return msg.content[0].text
+def answer(client: Optional[Anthropic], query: str, contexts):
+    """Answer using the retrieved contexts, with a local fallback when no API client is available."""
+    if not contexts:
+        return "I could not find relevant context in the uploaded documents."
+
+    if client is not None:
+        try:
+            context_block = "\n\n".join(
+                f"[Source: {c['source']}]\n{c['text']}" for c in contexts
+            )
+            system = (
+                "You are a document assistant. Answer the user's question using ONLY the "
+                "provided context. Cite the source filename for each claim. If the context "
+                "does not contain the answer, say so plainly."
+            )
+            msg = client.messages.create(
+                model=CHAT_MODEL,
+                max_tokens=1024,
+                system=system,
+                messages=[{
+                    "role": "user",
+                    "content": f"Context:\n{context_block}\n\nQuestion: {query}",
+                }],
+            )
+            return msg.content[0].text
+        except Exception:
+            pass
+
+    query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+    if not query_terms:
+        return "Please ask a question about the indexed documents."
+
+    best_context = None
+    best_score = -1
+    for context in contexts:
+        text = context["text"].lower()
+        score = sum(1 for term in query_terms if term in text)
+        if score > best_score:
+            best_score = score
+            best_context = context
+
+    if best_context is None:
+        return "I could not find a confident answer in the available context."
+
+    snippet = best_context["text"].strip()
+    if len(snippet) > 260:
+        snippet = snippet[:257].rstrip() + "..."
+    return f"Based on the available documents, {snippet} [Source: {best_context['source']}]"
