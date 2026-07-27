@@ -1,0 +1,6 @@
+streamlit>=1.38
+anthropic>=0.39
+voyageai>=0.3
+faiss-cpu>=1.8
+pypdf>=4.0
+numpy>=1.26
